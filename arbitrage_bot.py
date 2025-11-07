@@ -306,13 +306,15 @@ class PolymarketClient:
 class ArbitrageDetector:
     """Implements arbitrage detection strategies from IMDEA research"""
 
-    # Research-backed thresholds - Realistic for actual trading
-    MIN_PROFIT_THRESHOLD = 0.01  # 1 cent minimum (realistic spread)
+    # Research-backed thresholds - Based on 2024-2025 market analysis
+    # Real arbitrage found: 1-2.5% typical, up to 18% exceptional
+    MIN_PROFIT_THRESHOLD = 0.005  # 0.5 cents minimum (captures 0.5%+ spreads)
     MAX_PROFIT_THRESHOLD = 0.50  # 50 cents max (filter out stale markets)
+    MIN_LIQUIDITY = 5.0  # $5 minimum for realistic trading
     NEGRISK_MULTIPLIER = 29  # 29× capital efficiency advantage
-    WHALE_THRESHOLD = 1000  # $1,000+ trades (lowered)
-    HIGH_URGENCY_ROI = 0.05  # 5%+ ROI
-    MEDIUM_URGENCY_ROI = 0.02  # 2%+ ROI
+    WHALE_THRESHOLD = 1000  # $1,000+ trades
+    HIGH_URGENCY_ROI = 0.10  # 10%+ ROI (research shows this is common)
+    MEDIUM_URGENCY_ROI = 0.025  # 2.5%+ ROI (typical range)
 
     def __init__(self):
         self.opportunities: List[ArbitrageOpportunity] = []
@@ -387,7 +389,7 @@ class ArbitrageDetector:
                 no_liquidity = sum(float(ask.get('size', 0)) for ask in no_asks[:5])
                 min_liquidity = min(yes_liquidity, no_liquidity)
 
-                if min_liquidity < 10:  # Minimum $10 liquidity for realistic trading
+                if min_liquidity < self.MIN_LIQUIDITY:
                     return None
 
                 capital_required = sum_price * min_liquidity
@@ -510,7 +512,7 @@ class ArbitrageDetector:
             if deviation > self.MIN_PROFIT_THRESHOLD:
                 min_liquidity = min(liquidities)
 
-                if min_liquidity < 10:  # Minimum $10 liquidity for realistic trading
+                if min_liquidity < self.MIN_LIQUIDITY:
                     return None
 
                 capital_required = prob_sum * min_liquidity
@@ -723,15 +725,39 @@ class PredictionMarketBot:
                     except:
                         tokens = []
 
-                # If tokens is still empty, try other fields
+                # If tokens is still empty, try clob_token_ids from Gamma API
                 if not tokens:
-                    outcomes = market.get('outcomes') or market.get('options') or []
-                    if isinstance(outcomes, str):
-                        try:
-                            outcomes = json.loads(outcomes)
-                        except:
-                            outcomes = []
-                    tokens = outcomes
+                    clob_token_ids = market.get('clob_token_ids')
+                    outcomes_str = market.get('outcomes') or market.get('options') or []
+
+                    if clob_token_ids and outcomes_str:
+                        # Parse outcomes
+                        if isinstance(outcomes_str, str):
+                            try:
+                                outcomes_list = json.loads(outcomes_str)
+                            except:
+                                outcomes_list = []
+                        else:
+                            outcomes_list = outcomes_str
+
+                        # Parse clob_token_ids
+                        if isinstance(clob_token_ids, str):
+                            try:
+                                token_ids_list = json.loads(clob_token_ids)
+                            except:
+                                token_ids_list = []
+                        else:
+                            token_ids_list = clob_token_ids if isinstance(clob_token_ids, list) else []
+
+                        # Match outcomes with token_ids
+                        if len(token_ids_list) == len(outcomes_list):
+                            tokens = []
+                            for outcome, token_id in zip(outcomes_list, token_ids_list):
+                                tokens.append({
+                                    'outcome': outcome,
+                                    'token_id': token_id,
+                                    'price': 0.5  # Default, will be updated from orderbook
+                                })
 
                 if tokens and isinstance(tokens, list):
                     client.diagnostics['markets_with_tokens'] += 1
