@@ -223,9 +223,15 @@ class PolymarketClient:
                         self.diagnostics['orderbooks_with_data'] += 1
 
                     return book
-                return None
+                else:
+                    # Log non-200 responses for debugging
+                    if self.diagnostics['orderbooks_fetched'] <= 5:
+                        text = await resp.text()
+                        logger.info(f"❌ Orderbook API returned {resp.status} for token {token_id}: {text[:200]}")
+                    return None
         except Exception as e:
-            logger.debug(f"Error fetching orderbook for {token_id}: {e}")
+            if self.diagnostics['orderbooks_fetched'] <= 5:
+                logger.info(f"❌ Exception fetching orderbook for {token_id}: {e}")
             return None
 
     async def get_market_trades(self, market_id: str, limit: int = 100) -> List[Dict]:
@@ -648,12 +654,19 @@ class PredictionMarketBot:
 
                 # Log first market with tokens for debugging
                 if client.diagnostics['markets_with_tokens'] == 1:
-                    logger.info(f"📍 Sample market structure: {json.dumps(market, indent=2)[:500]}")
+                    logger.info(f"📍 Full market structure: {json.dumps(market, indent=2)}")
+                    logger.info(f"📍 Tokens found: {json.dumps(tokens, indent=2)}")
 
                 # Fetch orderbooks for all tokens
                 orderbooks = {}
                 for token in tokens[:10]:  # Limit to 10 tokens max
                     token_id = token.get('token_id') or token.get('id')
+
+                    # Debug: Log what token_id we're trying to use
+                    if client.diagnostics['markets_with_tokens'] <= 3:
+                        logger.info(f"🔎 Trying to fetch orderbook for token_id: {token_id}")
+                        logger.info(f"🔎 Token structure: {json.dumps(token, indent=2)}")
+
                     if token_id:
                         book = await client.get_orderbook(token_id)
                         if book:
@@ -661,6 +674,9 @@ class PredictionMarketBot:
                             # Log first orderbook for debugging
                             if client.diagnostics['orderbooks_with_data'] == 1:
                                 logger.info(f"📍 Sample orderbook structure: {json.dumps(book, indent=2)[:500]}")
+                        else:
+                            if client.diagnostics['markets_with_tokens'] <= 3:
+                                logger.info(f"❌ Failed to fetch orderbook for token_id: {token_id}")
                         await asyncio.sleep(0.05)  # Rate limiting
 
                 # Detect Single-Condition Arbitrage
