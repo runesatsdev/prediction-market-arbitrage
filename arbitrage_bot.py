@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Prediction Market Arbitrage Bot - FULL MARKET SCANNER
+Prediction Market Arbitrage Bot - FULL MARKET SCANNER WITH DIAGNOSTICS
 
 Based on IMDEA Networks research: $39.59M arbitrage extraction (Apr 2024-Apr 2025)
 
@@ -68,6 +68,13 @@ class PolymarketClient:
         self.session: Optional[aiohttp.ClientSession] = None
         self.markets_cache = {}
         self.orderbook_cache = defaultdict(lambda: deque(maxlen=100))
+        self.diagnostics = {
+            'markets_fetched': 0,
+            'markets_with_tokens': 0,
+            'orderbooks_fetched': 0,
+            'orderbooks_with_data': 0,
+            'markets_analyzed': 0
+        }
 
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=30)
@@ -102,15 +109,6 @@ class PolymarketClient:
             all_markets.extend(new_markets)
             logger.info(f"✓ Fetched {len(clob_markets)} markets from CLOB API ({len(new_markets)} new)")
 
-        # Strategy 3: Strapi API (market metadata)
-        strapi_markets = await self._fetch_from_strapi()
-        if strapi_markets:
-            existing_ids = {m.get('condition_id') or m.get('id') or m.get('market_id') for m in all_markets}
-            new_markets = [m for m in strapi_markets
-                          if (m.get('condition_id') or m.get('id') or m.get('market_id')) not in existing_ids]
-            all_markets.extend(new_markets)
-            logger.info(f"✓ Fetched {len(strapi_markets)} markets from Strapi API ({len(new_markets)} new)")
-
         if not all_markets:
             logger.warning("⚠️  Could not fetch markets from any endpoint")
             return []
@@ -121,6 +119,7 @@ class PolymarketClient:
             if market_id:
                 self.markets_cache[market_id] = market
 
+        self.diagnostics['markets_fetched'] = len(all_markets)
         logger.info(f"📊 TOTAL MARKETS LOADED: {len(all_markets)}")
         return all_markets
 
@@ -180,59 +179,9 @@ class PolymarketClient:
         all_markets = []
 
         try:
-            # Try different endpoints
-            endpoints = [
-                '/sampling-markets',
-                '/markets',
-            ]
-
-            for endpoint in endpoints:
-                for offset in range(0, 1000, 100):
-                    url = f"{self.CLOB_URL}{endpoint}"
-                    params = {
-                        'limit': 100,
-                        'offset': offset
-                    }
-
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
-                    }
-
-                    async with self.session.get(url, params=params, headers=headers) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            markets = data if isinstance(data, list) else []
-
-                            if not markets:
-                                break
-
-                            all_markets.extend(markets)
-
-                            if len(markets) < 100:
-                                break
-
-                            await asyncio.sleep(0.2)
-                        else:
-                            break
-
-                if all_markets:
-                    break  # Got markets from this endpoint
-
-            return all_markets
-
-        except Exception as e:
-            logger.debug(f"CLOB API pagination error: {e}")
-            return all_markets
-
-    async def _fetch_from_strapi(self) -> List[Dict]:
-        """Fetch from Strapi API (market metadata)"""
-        try:
-            url = f"{self.STRAPI_URL}/markets"
-            params = {
-                'pagination[limit]': 500,
-                'filters[closed][$eq]': 'false',
-                'filters[active][$eq]': 'true'
-            }
+            # Try sampling-markets endpoint which is more reliable
+            url = f"{self.CLOB_URL}/sampling-markets"
+            params = {'limit': 500}
 
             headers = {
                 'User-Agent': 'Mozilla/5.0 (compatible; ArbitrageBot/1.0)',
@@ -241,17 +190,14 @@ class PolymarketClient:
             async with self.session.get(url, params=params, headers=headers) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    markets = data if isinstance(data, list) else []
+                    all_markets.extend(markets)
 
-                    if isinstance(data, dict) and 'data' in data:
-                        markets = data['data']
-                        # Convert Strapi format to standard format
-                        return [m.get('attributes', m) for m in markets if isinstance(m, dict)]
-
-                return []
+            return all_markets
 
         except Exception as e:
-            logger.debug(f"Strapi API error: {e}")
-            return []
+            logger.debug(f"CLOB API pagination error: {e}")
+            return all_markets
 
     async def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """Get orderbook for a specific outcome token"""
@@ -267,8 +213,15 @@ class PolymarketClient:
             }
 
             async with self.session.get(url, params=params, headers=headers) as resp:
+                self.diagnostics['orderbooks_fetched'] += 1
+
                 if resp.status == 200:
                     book = await resp.json()
+
+                    # Check if orderbook has actual data
+                    if book and (book.get('asks') or book.get('bids')):
+                        self.diagnostics['orderbooks_with_data'] += 1
+
                     return book
                 return None
         except Exception as e:
@@ -302,16 +255,26 @@ class PolymarketClient:
 class ArbitrageDetector:
     """Implements arbitrage detection strategies from IMDEA research"""
 
-    # Research-backed thresholds
-    MIN_PROFIT_THRESHOLD = 0.015  # 1.5 cents minimum (lowered to catch more opportunities)
+    # Research-backed thresholds - VERY LOW to catch anything
+    MIN_PROFIT_THRESHOLD = 0.001  # 0.1 cents minimum (very low for testing)
     NEGRISK_MULTIPLIER = 29  # 29× capital efficiency advantage
-    WHALE_THRESHOLD = 5000  # $5,000+ trades
-    HIGH_URGENCY_ROI = 0.08  # 8%+ ROI (lowered threshold)
-    MEDIUM_URGENCY_ROI = 0.03  # 3%+ ROI (lowered threshold)
+    WHALE_THRESHOLD = 1000  # $1,000+ trades (lowered)
+    HIGH_URGENCY_ROI = 0.05  # 5%+ ROI
+    MEDIUM_URGENCY_ROI = 0.01  # 1%+ ROI
 
     def __init__(self):
         self.opportunities: List[ArbitrageOpportunity] = []
         self.whale_addresses = set()
+        self.diagnostics = {
+            'single_condition_checked': 0,
+            'single_condition_found': 0,
+            'negrisk_checked': 0,
+            'negrisk_found': 0,
+            'whale_checked': 0,
+            'whale_found': 0,
+            'no_orderbook': 0,
+            'no_prices': 0
+        }
 
     def detect_single_condition_arbitrage(
         self,
@@ -323,7 +286,10 @@ class ArbitrageDetector:
         Strategy 1: YES + NO ≠ $1.00
         IMDEA Research: $10.58M extracted, 7,051 conditions
         """
+        self.diagnostics['single_condition_checked'] += 1
+
         if not yes_orderbook or not no_orderbook:
+            self.diagnostics['no_orderbook'] += 1
             return None
 
         try:
@@ -332,16 +298,22 @@ class ArbitrageDetector:
             no_asks = no_orderbook.get('asks', [])
 
             if not yes_asks or not no_asks:
+                self.diagnostics['no_prices'] += 1
                 return None
 
             yes_best_ask = float(yes_asks[0].get('price', 0))
             no_best_ask = float(no_asks[0].get('price', 0))
 
             if yes_best_ask == 0 or no_best_ask == 0:
+                self.diagnostics['no_prices'] += 1
                 return None
 
             sum_price = yes_best_ask + no_best_ask
             deviation = abs(1.0 - sum_price)
+
+            # Log ALL deviations for debugging
+            if deviation > 0:
+                logger.debug(f"Price deviation found: {deviation:.4f} (sum={sum_price:.4f})")
 
             # Check if profitable
             if deviation > self.MIN_PROFIT_THRESHOLD:
@@ -350,7 +322,7 @@ class ArbitrageDetector:
                 no_liquidity = sum(float(ask.get('size', 0)) for ask in no_asks[:5])
                 min_liquidity = min(yes_liquidity, no_liquidity)
 
-                if min_liquidity < 5:  # Lowered minimum liquidity
+                if min_liquidity < 1:  # Very low threshold for testing
                     return None
 
                 capital_required = sum_price * min_liquidity
@@ -373,6 +345,8 @@ class ArbitrageDetector:
                            market.get('id') or
                            market.get('market_id') or
                            'unknown')
+
+                self.diagnostics['single_condition_found'] += 1
 
                 return ArbitrageOpportunity(
                     market_id=str(market_id),
@@ -407,6 +381,8 @@ class ArbitrageDetector:
         Strategy 2: NegRisk Rebalancing (Σ prices ≠ 1.0 across N≥3 conditions)
         IMDEA Research: $28.99M extracted, 662 markets, 29× capital efficiency
         """
+        self.diagnostics['negrisk_checked'] += 1
+
         # Get tokens from market
         tokens = (market.get('tokens') or
                  market.get('outcomes') or
@@ -448,11 +424,15 @@ class ArbitrageDetector:
             prob_sum = sum(prices)
             deviation = abs(1.0 - prob_sum)
 
+            # Log ALL deviations for debugging
+            if deviation > 0:
+                logger.debug(f"NegRisk deviation found: {deviation:.4f} (sum={prob_sum:.4f})")
+
             # Check if profitable
             if deviation > self.MIN_PROFIT_THRESHOLD:
                 min_liquidity = min(liquidities)
 
-                if min_liquidity < 5:  # Lowered minimum liquidity
+                if min_liquidity < 1:  # Very low threshold for testing
                     return None
 
                 capital_required = prob_sum * min_liquidity
@@ -474,6 +454,8 @@ class ArbitrageDetector:
                            market.get('id') or
                            market.get('market_id') or
                            'unknown')
+
+                self.diagnostics['negrisk_found'] += 1
 
                 return ArbitrageOpportunity(
                     market_id=str(market_id),
@@ -497,90 +479,6 @@ class ArbitrageDetector:
                 )
         except Exception as e:
             logger.debug(f"Error in NegRisk detection: {e}")
-
-        return None
-
-    def detect_whale_activity(
-        self,
-        market: Dict,
-        recent_trades: List[Dict]
-    ) -> Optional[ArbitrageOpportunity]:
-        """
-        Strategy 3: Whale Tracking
-        Research: Top performer made $2.01M with 11 trades/day
-        Whale signals predict 61.7-68.3% accuracy at T+15 to T+60 minutes
-        """
-        if not recent_trades:
-            return None
-
-        try:
-            # Filter for whale-sized trades (>$5K)
-            whale_trades = []
-
-            for trade in recent_trades[-50:]:  # Last 50 trades
-                size = float(trade.get('size', 0))
-                price = float(trade.get('price', 0))
-                trade_value = size * price
-
-                if trade_value >= self.WHALE_THRESHOLD:
-                    whale_trades.append({
-                        'trader': trade.get('maker_address', 'unknown'),
-                        'side': trade.get('side', 'unknown'),
-                        'size': size,
-                        'price': price,
-                        'value': trade_value,
-                        'timestamp': trade.get('timestamp', 0)
-                    })
-
-            if not whale_trades:
-                return None
-
-            # Analyze whale flow
-            recent_whale = whale_trades[-1]
-            total_whale_volume = sum(t['value'] for t in whale_trades)
-
-            # Calculate directional imbalance
-            buy_volume = sum(t['value'] for t in whale_trades if t['side'] == 'BUY')
-            sell_volume = sum(t['value'] for t in whale_trades if t['side'] == 'SELL')
-            flow_imbalance = (buy_volume - sell_volume) / (buy_volume + sell_volume) if (buy_volume + sell_volume) > 0 else 0
-
-            # Strong signal if imbalance > 40%
-            if abs(flow_imbalance) > 0.4:
-                expected_profit = total_whale_volume * 0.02  # Conservative 2% estimate
-                roi = 0.02  # Expected based on research
-                risk_score = self._calculate_risk_score(market, 'whale')
-
-                market_name = (market.get('question') or
-                             market.get('title') or
-                             market.get('description') or
-                             'Unknown Market')[:80]
-
-                market_id = (market.get('condition_id') or
-                           market.get('id') or
-                           market.get('market_id') or
-                           'unknown')
-
-                return ArbitrageOpportunity(
-                    market_id=str(market_id),
-                    market_name=market_name,
-                    opportunity_type='whale',
-                    expected_profit=expected_profit,
-                    roi=roi,
-                    capital_required=total_whale_volume * 0.1,  # 10% position
-                    risk_score=risk_score,
-                    urgency='high',
-                    details={
-                        'whale_count': len(whale_trades),
-                        'total_whale_volume': f"${total_whale_volume:,.0f}",
-                        'flow_imbalance': f"{flow_imbalance:.1%}",
-                        'dominant_side': 'BUY' if flow_imbalance > 0 else 'SELL',
-                        'recent_whale_size': f"${recent_whale['value']:,.0f}",
-                        'signal_strength': 'STRONG' if abs(flow_imbalance) > 0.6 else 'MODERATE'
-                    },
-                    timestamp=datetime.now()
-                )
-        except Exception as e:
-            logger.debug(f"Error in whale detection: {e}")
 
         return None
 
@@ -615,10 +513,6 @@ class ArbitrageDetector:
                 # More complex execution = more risk
                 num_tokens = len(market.get('tokens', []))
                 risk += min(0.2, num_tokens * 0.03)
-
-            elif strategy_type == 'whale':
-                # False positive risk
-                risk += 0.15
 
             # Subjective oracle risk
             question = (market.get('question') or
@@ -674,8 +568,24 @@ class AlertManager:
 
         logger.info(f"OPPORTUNITY: {opp.opportunity_type} - ${opp.expected_profit:.2f} profit, {opp.roi*100:.1f}% ROI")
 
-    def generate_summary(self, opportunities: List[ArbitrageOpportunity]):
-        """Generate summary statistics"""
+    def generate_summary(self, opportunities: List[ArbitrageOpportunity], client_diag: Dict, detector_diag: Dict):
+        """Generate summary statistics with diagnostics"""
+
+        print("\n" + "="*80)
+        print("📊 SCAN DIAGNOSTICS")
+        print("="*80)
+        print(f"Markets fetched: {client_diag['markets_fetched']}")
+        print(f"Markets with tokens: {client_diag['markets_with_tokens']}")
+        print(f"Orderbooks fetched: {client_diag['orderbooks_fetched']}")
+        print(f"Orderbooks with data: {client_diag['orderbooks_with_data']}")
+        print(f"\nSingle-Condition markets checked: {detector_diag['single_condition_checked']}")
+        print(f"Single-Condition opportunities found: {detector_diag['single_condition_found']}")
+        print(f"NegRisk markets checked: {detector_diag['negrisk_checked']}")
+        print(f"NegRisk opportunities found: {detector_diag['negrisk_found']}")
+        print(f"\nMarkets with no orderbook: {detector_diag['no_orderbook']}")
+        print(f"Markets with no prices: {detector_diag['no_prices']}")
+        print("="*80)
+
         if not opportunities:
             print("\n📊 No opportunities detected in this scan.\n")
             return
@@ -689,7 +599,7 @@ class AlertManager:
             by_type[opp.opportunity_type].append(opp)
 
         print("\n" + "="*80)
-        print("📊 SCAN SUMMARY")
+        print("📊 OPPORTUNITIES SUMMARY")
         print("="*80)
         print(f"Total Opportunities: {len(opportunities)}")
         print(f"Total Expected Profit: ${total_profit:.2f}")
@@ -725,16 +635,20 @@ class PredictionMarketBot:
                              market.get('description') or
                              'Unknown')[:60]
 
-                if (i + 1) % 10 == 0:  # Progress update every 10 markets
-                    logger.info(f"  [{i+1}/{len(markets)}] Processing...")
-
                 # Get tokens
                 tokens = (market.get('tokens') or
                         market.get('outcomes') or
                         market.get('options') or [])
 
+                if tokens:
+                    client.diagnostics['markets_with_tokens'] += 1
+
                 if not tokens:
                     continue
+
+                # Log first market with tokens for debugging
+                if client.diagnostics['markets_with_tokens'] == 1:
+                    logger.info(f"📍 Sample market structure: {json.dumps(market, indent=2)[:500]}")
 
                 # Fetch orderbooks for all tokens
                 orderbooks = {}
@@ -744,6 +658,9 @@ class PredictionMarketBot:
                         book = await client.get_orderbook(token_id)
                         if book:
                             orderbooks[token_id] = book
+                            # Log first orderbook for debugging
+                            if client.diagnostics['orderbooks_with_data'] == 1:
+                                logger.info(f"📍 Sample orderbook structure: {json.dumps(book, indent=2)[:500]}")
                         await asyncio.sleep(0.05)  # Rate limiting
 
                 # Detect Single-Condition Arbitrage
@@ -769,21 +686,9 @@ class PredictionMarketBot:
                         opportunities.append(opp)
                         self.alert_manager.display_opportunity(opp)
 
-                # Strategy 3: Whale Tracking (sample 20% of markets to save API calls)
-                if i % 5 == 0:  # Check every 5th market
-                    market_id = (market.get('condition_id') or
-                               market.get('id') or
-                               market.get('market_id'))
-
-                    if market_id:
-                        trades = await client.get_market_trades(market_id)
-                        opp = self.detector.detect_whale_activity(market, trades)
-
-                        if opp:
-                            opportunities.append(opp)
-                            self.alert_manager.display_opportunity(opp)
-
                 await asyncio.sleep(0.1)  # Rate limiting
+
+                client.diagnostics['markets_analyzed'] += 1
 
             except Exception as e:
                 logger.debug(f"  ⚠️  Error analyzing market: {e}")
@@ -813,13 +718,13 @@ class PredictionMarketBot:
             logger.info(f"🎯 Analyzing {len(all_markets)} markets for arbitrage...\n")
 
             # Process in batches to manage memory and provide progress updates
-            batch_size = 25
+            batch_size = 50  # Increased batch size
             all_opportunities = []
 
-            for i in range(0, len(all_markets), batch_size):
+            for i in range(0, min(len(all_markets), 100), batch_size):  # LIMIT TO 100 for testing
                 batch = all_markets[i:i+batch_size]
                 batch_num = (i // batch_size) + 1
-                total_batches = (len(all_markets) + batch_size - 1) // batch_size
+                total_batches = min((len(all_markets) + batch_size - 1) // batch_size, 2)
 
                 batch_opps = await self.analyze_market_batch(
                     batch, client, batch_num, total_batches
@@ -829,35 +734,25 @@ class PredictionMarketBot:
                 # Small delay between batches
                 await asyncio.sleep(0.5)
 
-            # Generate summary
-            self.alert_manager.generate_summary(all_opportunities)
+            # Generate summary with diagnostics
+            self.alert_manager.generate_summary(all_opportunities, client.diagnostics, self.detector.diagnostics)
 
             logger.info(f"✓ Scan #{self.scan_count} complete. Found {len(all_opportunities)} opportunities.")
             logger.info(f"⏰ Next scan in {self.scan_interval} seconds...\n")
 
     async def run_continuous(self):
         """Run continuous monitoring - FULL MARKET"""
-        logger.info("🚀 Prediction Market Arbitrage Bot Starting (FULL MARKET MODE)...")
+        logger.info("🚀 Prediction Market Arbitrage Bot Starting (FULL MARKET MODE WITH DIAGNOSTICS)...")
         logger.info(f"📊 Scanning ALL available markets")
         logger.info(f"⏰ Scan interval: {self.scan_interval} seconds")
-        logger.info(f"💰 Minimum profit threshold: ${self.detector.MIN_PROFIT_THRESHOLD*100:.1f} cents")
+        logger.info(f"💰 Minimum profit threshold: ${self.detector.MIN_PROFIT_THRESHOLD*100:.2f} cents")
         logger.info("\nStrategies Active:")
         logger.info("  1. Single-Condition Arbitrage (YES+NO≠$1.00)")
         logger.info("  2. NegRisk Rebalancing (Σprices≠1.00, 29× efficiency)")
-        logger.info("  3. Whale Tracking (>$5K trades)")
         logger.info("\n" + "="*80 + "\n")
 
-        while True:
-            try:
-                await self.run_single_scan()
-                await asyncio.sleep(self.scan_interval)
-            except KeyboardInterrupt:
-                logger.info("\n\n🛑 Bot stopped by user")
-                break
-            except Exception as e:
-                logger.error(f"⚠️  Error in main loop: {e}")
-                logger.info(f"   Retrying in {self.scan_interval} seconds...")
-                await asyncio.sleep(self.scan_interval)
+        # Run only once for testing
+        await self.run_single_scan()
 
 
 # ============================================================================
@@ -870,7 +765,7 @@ async def main():
     print("""
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                  PREDICTION MARKET ARBITRAGE BOT                          ║
-║                        FULL MARKET SCANNER                                ║
+║                  FULL MARKET SCANNER + DIAGNOSTICS                        ║
 ║                                                                           ║
 ║  Based on IMDEA Networks Research: $39.59M Arbitrage Extracted           ║
 ║  April 2024 - April 2025                                                 ║
@@ -878,9 +773,8 @@ async def main():
 ║  Strategies:                                                             ║
 ║    • Single-Condition: $10.58M extracted (7,051 conditions)              ║
 ║    • NegRisk: $28.99M extracted (662 markets, 29× efficiency)            ║
-║    • Whale Tracking: Top performer $2.01M (4,049 trades)                 ║
 ║                                                                           ║
-║  🔥 FULL MARKET MODE: Scanning ALL available markets                     ║
+║  🔥 DIAGNOSTIC MODE: Testing first 100 markets                           ║
 ║                                                                           ║
 ║  ⚠️  DISCLAIMER: Detection only - NOT automatic execution                 ║
 ║  ⚠️  Always verify opportunities manually before trading                  ║
